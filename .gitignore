@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+logs
+
 # C extensions
 *.so
 
@@ -113,3 +115,8 @@ DG_data/*/*
 !DG_data/myket/*
 processed_data/*/*
 !processed_data/myket/*
+
+# run outputs
+saved_models/
+saved_results/
+scores/
