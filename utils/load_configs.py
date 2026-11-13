@@ -245,7 +245,7 @@ def get_node_classification_args():
     """
     # arguments
     parser = argparse.ArgumentParser('Interface for the node classification task')
-    parser.add_argument('--dataset_name', type=str, help='dataset to be used', default='wikipedia', choices=['wikipedia', 'reddit'])
+    parser.add_argument('--dataset_name', type=str, help='dataset to be used', default='wikipedia', choices=['wikipedia', 'reddit', 'mooc'])
     parser.add_argument('--batch_size', type=int, default=200, help='batch size')
     parser.add_argument('--model_name', type=str, default='DyGFormer', help='name of the model',
                         choices=['JODIE', 'DyRep', 'TGAT', 'TGN', 'CAWN', 'TCL', 'GraphMixer', 'DyGFormer'])
@@ -284,7 +284,7 @@ def get_node_classification_args():
         parser.print_help()
         sys.exit()
 
-    assert args.dataset_name in ['wikipedia', 'reddit'], f'Wrong value for dataset_name {args.dataset_name}!'
+    assert args.dataset_name in ['wikipedia', 'reddit', 'mooc'], f'Wrong value for dataset_name {args.dataset_name}!'
     if args.load_best_configs:
         load_node_classification_best_configs(args=args)
 

@@ -160,7 +160,8 @@ def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_s
 
 
 def evaluate_model_node_classification(model_name: str, model: nn.Module, neighbor_sampler: NeighborSampler, evaluate_idx_data_loader: DataLoader,
-                                       evaluate_data: Data, loss_func: nn.Module, num_neighbors: int = 20, time_gap: int = 2000):
+                                       evaluate_data: Data, loss_func: nn.Module, num_neighbors: int = 20, time_gap: int = 2000,
+                                       predicts_list: list = None):
     """
     evaluate models on the node classification task
     :param model_name: str, name of the model
@@ -171,6 +172,8 @@ def evaluate_model_node_classification(model_name: str, model: nn.Module, neighb
     :param loss_func: nn.Module, loss function
     :param num_neighbors: int, number of neighbors to sample for each node
     :param time_gap: int, time gap for neighbors to compute node features
+    :param predicts_list: list, if given, the predicted probabilities of the edges in evaluate_data
+    are appended to it batch by batch, each an ndarray with shape (batch_size, )
     :return:
     """
     if model_name in ['DyRep', 'TGAT', 'TGN', 'CAWN', 'TCL', 'GraphMixer', 'DyGFormer']:
@@ -235,6 +238,8 @@ def evaluate_model_node_classification(model_name: str, model: nn.Module, neighb
 
             evaluate_y_trues.append(labels)
             evaluate_y_predicts.append(predicts)
+            if predicts_list is not None:
+                predicts_list.append(predicts.double().cpu().numpy())
 
             evaluate_idx_data_loader_tqdm.set_description(f'evaluate for the {batch_idx + 1}-th batch, evaluate loss: {loss.item()}')
 

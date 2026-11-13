@@ -7,6 +7,7 @@ import numpy as np
 import warnings
 import shutil
 import json
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -20,10 +21,35 @@ from models.modules import MergeLayer, MLPClassifier
 from utils.utils import set_random_seed, convert_to_gpu, get_parameter_sizes, create_optimizer
 from utils.utils import get_neighbor_sampler
 from evaluate_models_utils import evaluate_model_node_classification
-from utils.metrics import get_node_classification_metrics
+from utils.metrics import get_node_classification_metrics, get_anomaly_detection_metrics
 from utils.DataLoader import get_idx_data_loader, get_node_classification_data
 from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_node_classification_args
+
+# the classifier is trained with the organic labels on top of a frozen link prediction backbone
+TRAINING_SIGNAL = 'supervised'
+
+
+def log_organic_label_metrics(logger: logging.Logger, split_name: str, predicts_list: list, labels: np.ndarray, num_bootstraps: int = 0):
+    """
+    log the anomaly detection metrics of the edges of a split against the organic labels, computed over the whole split,
+    the anomaly score of an edge is the predicted probability of its label
+    :param logger: Logger
+    :param split_name: str, name of the split, 'validate' or 'test'
+    :param predicts_list: list of ndarray, predicted probabilities of the edges, batch by batch
+    :param labels: ndarray, shape (num_edges, ), organic labels of the edges
+    :param num_bootstraps: int, number of resamples for the 95% interval of average precision, 0 to skip
+    :return:
+        dictionary of metrics {'metric_name_1': metric_1, ...}
+    """
+    organic_metrics = get_anomaly_detection_metrics(scores=np.concatenate(predicts_list), labels=labels, num_bootstraps=num_bootstraps)
+    for metric_name in ['average_precision', 'roc_auc', 'recall_at_k', 'precision_at_100']:
+        logger.info(f'{split_name} organic {metric_name}, {organic_metrics[metric_name]:.4f}')
+    if num_bootstraps > 0:
+        logger.info(f'{split_name} organic average_precision 95% interval, '
+                    f'[{organic_metrics["average_precision_ci_low"]:.4f}, {organic_metrics["average_precision_ci_high"]:.4f}]')
+    return organic_metrics
+
 
 if __name__ == "__main__":
 
@@ -229,6 +255,7 @@ if __name__ == "__main__":
 
             train_metrics = get_node_classification_metrics(predicts=train_y_predicts, labels=train_y_trues)
 
+            val_predicts_list = []
             val_total_loss, val_metrics = evaluate_model_node_classification(model_name=args.model_name,
                                                                              model=model,
                                                                              neighbor_sampler=full_neighbor_sampler,
@@ -236,7 +263,8 @@ if __name__ == "__main__":
                                                                              evaluate_data=val_data,
                                                                              loss_func=loss_func,
                                                                              num_neighbors=args.num_neighbors,
-                                                                             time_gap=args.time_gap)
+                                                                             time_gap=args.time_gap,
+                                                                             predicts_list=val_predicts_list)
 
             logger.info(f'Epoch: {epoch + 1}, learning rate: {optimizer.param_groups[0]["lr"]}, train loss: {train_total_loss:.4f}')
             for metric_name in train_metrics.keys():
@@ -244,6 +272,8 @@ if __name__ == "__main__":
             logger.info(f'validate loss: {val_total_loss:.4f}')
             for metric_name in val_metrics.keys():
                 logger.info(f'validate {metric_name}, {val_metrics[metric_name]:.4f}')
+            # logged only, the model is still selected by the stock validation metrics
+            log_organic_label_metrics(logger=logger, split_name='validate', predicts_list=val_predicts_list, labels=val_data.labels)
 
             # perform testing once after test_interval_epochs
             if (epoch + 1) % args.test_interval_epochs == 0:
@@ -286,6 +316,7 @@ if __name__ == "__main__":
 
         # the saved best model of memory-based models cannot perform validation since the stored memory has been updated by validation data
         if args.model_name not in ['JODIE', 'DyRep', 'TGN']:
+            val_predicts_list = []
             val_total_loss, val_metrics = evaluate_model_node_classification(model_name=args.model_name,
                                                                              model=model,
                                                                              neighbor_sampler=full_neighbor_sampler,
@@ -293,8 +324,10 @@ if __name__ == "__main__":
                                                                              evaluate_data=val_data,
                                                                              loss_func=loss_func,
                                                                              num_neighbors=args.num_neighbors,
-                                                                             time_gap=args.time_gap)
+                                                                             time_gap=args.time_gap,
+                                                                             predicts_list=val_predicts_list)
 
+        test_predicts_list = []
         test_total_loss, test_metrics = evaluate_model_node_classification(model_name=args.model_name,
                                                                            model=model,
                                                                            neighbor_sampler=full_neighbor_sampler,
@@ -302,7 +335,8 @@ if __name__ == "__main__":
                                                                            evaluate_data=test_data,
                                                                            loss_func=loss_func,
                                                                            num_neighbors=args.num_neighbors,
-                                                                           time_gap=args.time_gap)
+                                                                           time_gap=args.time_gap,
+                                                                           predicts_list=test_predicts_list)
 
         # store the evaluation metrics at the current run
         val_metric_dict, test_metric_dict = {}, {}
@@ -313,12 +347,27 @@ if __name__ == "__main__":
                 val_metric = val_metrics[metric_name]
                 logger.info(f'validate {metric_name}, {val_metric:.4f}')
                 val_metric_dict[metric_name] = val_metric
+            organic_val_metric_dict = log_organic_label_metrics(logger=logger, split_name='validate', predicts_list=val_predicts_list,
+                                                                labels=val_data.labels, num_bootstraps=1000)
 
         logger.info(f'test loss: {test_total_loss:.4f}')
         for metric_name in test_metrics.keys():
             test_metric = test_metrics[metric_name]
             logger.info(f'test {metric_name}, {test_metric:.4f}')
             test_metric_dict[metric_name] = test_metric
+        organic_test_metric_dict = log_organic_label_metrics(logger=logger, split_name='test', predicts_list=test_predicts_list,
+                                                             labels=test_data.labels, num_bootstraps=1000)
+
+        # save the scores of the test edges (and validation edges if they were scored with the best model) in the protocol layout
+        train_ratio = 1 - args.val_ratio - args.test_ratio
+        split_name = f'{round(100 * train_ratio)}-{round(100 * args.val_ratio)}-{round(100 * args.test_ratio)}'
+        score_folder = f"./scores/{args.dataset_name}/{split_name}/{args.model_name}/{TRAINING_SIGNAL}"
+        os.makedirs(score_folder, exist_ok=True)
+        if args.model_name not in ['JODIE', 'DyRep', 'TGN']:
+            score_edge_ids, scores = np.concatenate([val_data.edge_ids, test_data.edge_ids]), np.concatenate(val_predicts_list + test_predicts_list)
+        else:
+            score_edge_ids, scores = test_data.edge_ids, np.concatenate(test_predicts_list)
+        pd.DataFrame({'edge_id': score_edge_ids, 'score': scores}).to_csv(os.path.join(score_folder, f"seed{args.seed}.csv"), index=False)
 
         single_run_time = time.time() - run_start_time
         logger.info(f'Run {run + 1} cost {single_run_time:.2f} seconds.')
@@ -336,12 +385,14 @@ if __name__ == "__main__":
         if args.model_name not in ['JODIE', 'DyRep', 'TGN']:
             result_json = {
                 "validate metrics": {metric_name: f'{val_metric_dict[metric_name]:.4f}' for metric_name in val_metric_dict},
-                "test metrics": {metric_name: f'{test_metric_dict[metric_name]:.4f}' for metric_name in test_metric_dict}
+                "test metrics": {metric_name: f'{test_metric_dict[metric_name]:.4f}' for metric_name in test_metric_dict},
+                "organic validate metrics": organic_val_metric_dict
             }
         else:
             result_json = {
                 "test metrics": {metric_name: f'{test_metric_dict[metric_name]:.4f}' for metric_name in test_metric_dict}
             }
+        result_json["organic test metrics"] = organic_test_metric_dict
         result_json = json.dumps(result_json, indent=4)
 
         save_result_folder = f"./saved_results/{args.model_name}/{args.dataset_name}"
