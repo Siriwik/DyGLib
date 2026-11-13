@@ -36,6 +36,28 @@ def get_node_classification_metrics(predicts: torch.Tensor, labels: torch.Tensor
     return {'roc_auc': roc_auc}
 
 
+def expected_precision_at(scores: np.ndarray, labels: np.ndarray, k: int):
+    """
+    precision among the k highest scored edges, as the expected value over a uniformly random order of tied scores
+    (equal to recall at k when k is the number of anomalies)
+    :param scores: ndarray, shape (num_edges, ), anomaly scores, higher means more anomalous
+    :param labels: ndarray, shape (num_edges, ), 1 for anomalous edges and 0 for normal edges
+    :param k: int, number of top edges
+    :return:
+        float
+    """
+    k = min(k, len(scores))
+    if k == 0:
+        return 0.0
+    # the k-th highest score, its tie group may cross the cutoff
+    kth_score = np.sort(scores)[::-1][k - 1]
+    above_mask = scores > kth_score
+    tie_mask = scores == kth_score
+    num_slots_left = k - above_mask.sum()
+    # the slots left are filled by a random subset of the tie group, whose expected number of positives is slots * positive rate
+    return float((labels[above_mask].sum() + num_slots_left * labels[tie_mask].mean()) / k)
+
+
 def get_anomaly_detection_metrics(scores: np.ndarray, labels: np.ndarray, num_bootstraps: int = 1000, seed: int = 0):
     """
     get metrics for the edge anomaly detection task, computed over all the edges at once (not per batch)
@@ -48,17 +70,15 @@ def get_anomaly_detection_metrics(scores: np.ndarray, labels: np.ndarray, num_bo
     """
     labels = (labels != 0).astype(int)
     num_anomalies = int(labels.sum())
-    # edges sorted from the most to the least anomalous
-    ranked_labels = labels[np.argsort(-scores, kind='stable')]
 
     metrics = {'num_edges': len(labels),
                'num_anomalies': num_anomalies,
                'chance_average_precision': num_anomalies / len(labels),
                'average_precision': average_precision_score(y_true=labels, y_score=scores),
                'roc_auc': roc_auc_score(y_true=labels, y_score=scores),
-               # recall among the top-K edges with K = number of anomalies, which is equal to precision at K
-               'recall_at_k': ranked_labels[:num_anomalies].mean(),
-               'precision_at_100': ranked_labels[:100].mean()}
+               # recall among the top-K edges with K = number of anomalies, which is equal to precision at K, ties are counted at their expected value
+               'recall_at_k': expected_precision_at(scores=scores, labels=labels, k=num_anomalies),
+               'precision_at_100': expected_precision_at(scores=scores, labels=labels, k=100)}
 
     if num_bootstraps > 0:
         random_state = np.random.RandomState(seed)
