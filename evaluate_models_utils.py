@@ -18,7 +18,7 @@ from utils.DataLoader import Data
 
 def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_sampler: NeighborSampler, evaluate_idx_data_loader: DataLoader,
                                    evaluate_neg_edge_sampler: NegativeEdgeSampler, evaluate_data: Data, loss_func: nn.Module,
-                                   num_neighbors: int = 20, time_gap: int = 2000):
+                                   num_neighbors: int = 20, time_gap: int = 2000, positive_probabilities_list: list = None):
     """
     evaluate models on the link prediction task
     :param model_name: str, name of the model
@@ -30,6 +30,8 @@ def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_s
     :param loss_func: nn.Module, loss function
     :param num_neighbors: int, number of neighbors to sample for each node
     :param time_gap: int, time gap for neighbors to compute node features
+    :param positive_probabilities_list: list, if given, the predicted probabilities of the (real) edges in evaluate_data
+    are appended to it batch by batch, each an ndarray with shape (batch_size, )
     :return:
     """
     # Ensures the random sampler uses a fixed seed for evaluation (i.e. we always sample the same negatives for validation / test set)
@@ -139,6 +141,9 @@ def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_s
             # get positive and negative probabilities, shape (batch_size, )
             positive_probabilities = model[1](input_1=batch_src_node_embeddings, input_2=batch_dst_node_embeddings).squeeze(dim=-1).sigmoid()
             negative_probabilities = model[1](input_1=batch_neg_src_node_embeddings, input_2=batch_neg_dst_node_embeddings).squeeze(dim=-1).sigmoid()
+
+            if positive_probabilities_list is not None:
+                positive_probabilities_list.append(positive_probabilities.double().cpu().numpy())
 
             predicts = torch.cat([positive_probabilities, negative_probabilities], dim=0)
             labels = torch.cat([torch.ones_like(positive_probabilities), torch.zeros_like(negative_probabilities)], dim=0)

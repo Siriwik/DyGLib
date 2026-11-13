@@ -49,6 +49,8 @@ def get_link_prediction_args(is_evaluation: bool = False):
     parser.add_argument('--negative_sample_strategy', type=str, default='random', choices=['random', 'historical', 'inductive'],
                         help='strategy for the negative edge sampling')
     parser.add_argument('--load_best_configs', action='store_true', default=False, help='whether to load the best configurations')
+    parser.add_argument('--no_new_node_holdout', action='store_true', default=False,
+                        help='whether to keep all the training edges instead of removing the edges of 10%% of the nodes for inductive evaluation')
 
     try:
         args = parser.parse_args()

@@ -20,10 +20,32 @@ from models.modules import MergeLayer
 from utils.utils import set_random_seed, convert_to_gpu, get_parameter_sizes, create_optimizer
 from utils.utils import get_neighbor_sampler, NegativeEdgeSampler
 from evaluate_models_utils import evaluate_model_link_prediction
-from utils.metrics import get_link_prediction_metrics
+from utils.metrics import get_link_prediction_metrics, get_anomaly_detection_metrics
 from utils.DataLoader import get_idx_data_loader, get_link_prediction_data
 from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_link_prediction_args
+
+
+def log_organic_label_metrics(logger: logging.Logger, split_name: str, positive_probabilities_list: list, labels: np.ndarray, num_bootstraps: int = 0):
+    """
+    log the anomaly detection metrics of the (real) edges of a split against the organic labels of the dataset,
+    the anomaly score of an edge is 1 - p, where p is the predicted probability of the edge
+    :param logger: Logger
+    :param split_name: str, name of the split, 'validate' or 'test'
+    :param positive_probabilities_list: list of ndarray, predicted probabilities of the edges, batch by batch
+    :param labels: ndarray, shape (num_edges, ), organic labels of the edges
+    :param num_bootstraps: int, number of resamples for the 95% interval of average precision, 0 to skip
+    :return:
+        dictionary of metrics {'metric_name_1': metric_1, ...}
+    """
+    organic_metrics = get_anomaly_detection_metrics(scores=1 - np.concatenate(positive_probabilities_list), labels=labels, num_bootstraps=num_bootstraps)
+    for metric_name in ['average_precision', 'roc_auc', 'recall_at_k', 'precision_at_100']:
+        logger.info(f'{split_name} organic {metric_name}, {organic_metrics[metric_name]:.4f}')
+    if num_bootstraps > 0:
+        logger.info(f'{split_name} organic average_precision 95% interval, '
+                    f'[{organic_metrics["average_precision_ci_low"]:.4f}, {organic_metrics["average_precision_ci_high"]:.4f}]')
+    return organic_metrics
+
 
 if __name__ == "__main__":
 
@@ -34,7 +56,8 @@ if __name__ == "__main__":
 
     # get data for training, validation and testing
     node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
-        get_link_prediction_data(dataset_name=args.dataset_name, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
+        get_link_prediction_data(dataset_name=args.dataset_name, val_ratio=args.val_ratio, test_ratio=args.test_ratio,
+                                 new_node_holdout=not args.no_new_node_holdout)
 
     # initialize training neighbor sampler to retrieve temporal graph
     train_neighbor_sampler = get_neighbor_sampler(data=train_data, sample_neighbor_strategy=args.sample_neighbor_strategy,
@@ -266,6 +289,7 @@ if __name__ == "__main__":
                 # backup memory bank after training so it can be used for new validation nodes
                 train_backup_memory_bank = model[0].memory_bank.backup_memory_bank()
 
+            val_positive_probabilities_list = []
             val_losses, val_metrics = evaluate_model_link_prediction(model_name=args.model_name,
                                                                      model=model,
                                                                      neighbor_sampler=full_neighbor_sampler,
@@ -274,7 +298,8 @@ if __name__ == "__main__":
                                                                      evaluate_data=val_data,
                                                                      loss_func=loss_func,
                                                                      num_neighbors=args.num_neighbors,
-                                                                     time_gap=args.time_gap)
+                                                                     time_gap=args.time_gap,
+                                                                     positive_probabilities_list=val_positive_probabilities_list)
 
             if args.model_name in ['JODIE', 'DyRep', 'TGN']:
                 # backup memory bank after validating so it can be used for testing nodes (since test edges are strictly later in time than validation edges)
@@ -304,12 +329,15 @@ if __name__ == "__main__":
             logger.info(f'validate loss: {np.mean(val_losses):.4f}')
             for metric_name in val_metrics[0].keys():
                 logger.info(f'validate {metric_name}, {np.mean([val_metric[metric_name] for val_metric in val_metrics]):.4f}')
+            # the organic labels are only logged, they are not used for training or for early stopping
+            log_organic_label_metrics(logger=logger, split_name='validate', positive_probabilities_list=val_positive_probabilities_list, labels=val_data.labels)
             logger.info(f'new node validate loss: {np.mean(new_node_val_losses):.4f}')
             for metric_name in new_node_val_metrics[0].keys():
                 logger.info(f'new node validate {metric_name}, {np.mean([new_node_val_metric[metric_name] for new_node_val_metric in new_node_val_metrics]):.4f}')
 
             # perform testing once after test_interval_epochs
             if (epoch + 1) % args.test_interval_epochs == 0:
+                test_positive_probabilities_list = []
                 test_losses, test_metrics = evaluate_model_link_prediction(model_name=args.model_name,
                                                                            model=model,
                                                                            neighbor_sampler=full_neighbor_sampler,
@@ -318,7 +346,8 @@ if __name__ == "__main__":
                                                                            evaluate_data=test_data,
                                                                            loss_func=loss_func,
                                                                            num_neighbors=args.num_neighbors,
-                                                                           time_gap=args.time_gap)
+                                                                           time_gap=args.time_gap,
+                                                                           positive_probabilities_list=test_positive_probabilities_list)
 
                 if args.model_name in ['JODIE', 'DyRep', 'TGN']:
                     # reload validation memory bank for new testing nodes
@@ -342,6 +371,7 @@ if __name__ == "__main__":
                 logger.info(f'test loss: {np.mean(test_losses):.4f}')
                 for metric_name in test_metrics[0].keys():
                     logger.info(f'test {metric_name}, {np.mean([test_metric[metric_name] for test_metric in test_metrics]):.4f}')
+                log_organic_label_metrics(logger=logger, split_name='test', positive_probabilities_list=test_positive_probabilities_list, labels=test_data.labels)
                 logger.info(f'new node test loss: {np.mean(new_node_test_losses):.4f}')
                 for metric_name in new_node_test_metrics[0].keys():
                     logger.info(f'new node test {metric_name}, {np.mean([new_node_test_metric[metric_name] for new_node_test_metric in new_node_test_metrics]):.4f}')
@@ -363,6 +393,7 @@ if __name__ == "__main__":
 
         # the saved best model of memory-based models cannot perform validation since the stored memory has been updated by validation data
         if args.model_name not in ['JODIE', 'DyRep', 'TGN']:
+            val_positive_probabilities_list = []
             val_losses, val_metrics = evaluate_model_link_prediction(model_name=args.model_name,
                                                                      model=model,
                                                                      neighbor_sampler=full_neighbor_sampler,
@@ -371,7 +402,8 @@ if __name__ == "__main__":
                                                                      evaluate_data=val_data,
                                                                      loss_func=loss_func,
                                                                      num_neighbors=args.num_neighbors,
-                                                                     time_gap=args.time_gap)
+                                                                     time_gap=args.time_gap,
+                                                                     positive_probabilities_list=val_positive_probabilities_list)
 
             new_node_val_losses, new_node_val_metrics = evaluate_model_link_prediction(model_name=args.model_name,
                                                                                        model=model,
@@ -387,6 +419,7 @@ if __name__ == "__main__":
             # the memory in the best model has seen the validation edges, we need to backup the memory for new testing nodes
             val_backup_memory_bank = model[0].memory_bank.backup_memory_bank()
 
+        test_positive_probabilities_list = []
         test_losses, test_metrics = evaluate_model_link_prediction(model_name=args.model_name,
                                                                    model=model,
                                                                    neighbor_sampler=full_neighbor_sampler,
@@ -395,7 +428,8 @@ if __name__ == "__main__":
                                                                    evaluate_data=test_data,
                                                                    loss_func=loss_func,
                                                                    num_neighbors=args.num_neighbors,
-                                                                   time_gap=args.time_gap)
+                                                                   time_gap=args.time_gap,
+                                                                   positive_probabilities_list=test_positive_probabilities_list)
 
         if args.model_name in ['JODIE', 'DyRep', 'TGN']:
             # reload validation memory bank for new testing nodes
@@ -419,6 +453,8 @@ if __name__ == "__main__":
                 average_val_metric = np.mean([val_metric[metric_name] for val_metric in val_metrics])
                 logger.info(f'validate {metric_name}, {average_val_metric:.4f}')
                 val_metric_dict[metric_name] = average_val_metric
+            organic_val_metric_dict = log_organic_label_metrics(logger=logger, split_name='validate', positive_probabilities_list=val_positive_probabilities_list,
+                                                                labels=val_data.labels, num_bootstraps=1000)
 
             logger.info(f'new node validate loss: {np.mean(new_node_val_losses):.4f}')
             for metric_name in new_node_val_metrics[0].keys():
@@ -431,6 +467,8 @@ if __name__ == "__main__":
             average_test_metric = np.mean([test_metric[metric_name] for test_metric in test_metrics])
             logger.info(f'test {metric_name}, {average_test_metric:.4f}')
             test_metric_dict[metric_name] = average_test_metric
+        organic_test_metric_dict = log_organic_label_metrics(logger=logger, split_name='test', positive_probabilities_list=test_positive_probabilities_list,
+                                                             labels=test_data.labels, num_bootstraps=1000)
 
         logger.info(f'new node test loss: {np.mean(new_node_test_losses):.4f}')
         for metric_name in new_node_test_metrics[0].keys():
@@ -458,13 +496,15 @@ if __name__ == "__main__":
                 "validate metrics": {metric_name: f'{val_metric_dict[metric_name]:.4f}' for metric_name in val_metric_dict},
                 "new node validate metrics": {metric_name: f'{new_node_val_metric_dict[metric_name]:.4f}' for metric_name in new_node_val_metric_dict},
                 "test metrics": {metric_name: f'{test_metric_dict[metric_name]:.4f}' for metric_name in test_metric_dict},
-                "new node test metrics": {metric_name: f'{new_node_test_metric_dict[metric_name]:.4f}' for metric_name in new_node_test_metric_dict}
+                "new node test metrics": {metric_name: f'{new_node_test_metric_dict[metric_name]:.4f}' for metric_name in new_node_test_metric_dict},
+                "organic validate metrics": organic_val_metric_dict
             }
         else:
             result_json = {
                 "test metrics": {metric_name: f'{test_metric_dict[metric_name]:.4f}' for metric_name in test_metric_dict},
                 "new node test metrics": {metric_name: f'{new_node_test_metric_dict[metric_name]:.4f}' for metric_name in new_node_test_metric_dict}
             }
+        result_json["organic test metrics"] = organic_test_metric_dict
         result_json = json.dumps(result_json, indent=4)
 
         save_result_folder = f"./saved_results/{args.model_name}/{args.dataset_name}"

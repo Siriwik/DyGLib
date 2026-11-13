@@ -94,7 +94,8 @@ if __name__ == "__main__":
 
     # get data, the new node data is not used
     node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, _, _ = \
-        get_link_prediction_data(dataset_name=args.dataset_name, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
+        get_link_prediction_data(dataset_name=args.dataset_name, val_ratio=args.val_ratio, test_ratio=args.test_ratio,
+                                 new_node_holdout=not args.no_new_node_holdout)
 
     # validation and test neighbor sampler uses all the graph information
     full_neighbor_sampler = get_neighbor_sampler(data=full_data, sample_neighbor_strategy=args.sample_neighbor_strategy,
