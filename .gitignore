@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 logs
+scores_archive
 
 # C extensions
 *.so
