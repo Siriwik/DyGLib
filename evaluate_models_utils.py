@@ -10,6 +10,7 @@ import os
 import json
 
 from models.EdgeBank import edge_bank_link_prediction
+from models.modules import compute_link_logits, get_edge_messages
 from utils.metrics import get_link_prediction_metrics, get_node_classification_metrics
 from utils.utils import set_random_seed
 from utils.utils import NegativeEdgeSampler, NeighborSampler
@@ -138,9 +139,13 @@ def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_s
                                                                       node_interact_times=batch_node_interact_times)
             else:
                 raise ValueError(f"Wrong value for model_name {model_name}!")
+            # message of each queried edge, shape (batch_size, edge_feat_dim).
+            # the negatives are structural (destination swapped, or both nodes for historical and inductive sampling),
+            # so they keep the message of the real edge they were built from
+            batch_edge_messages = get_edge_messages(model[0].edge_raw_features, batch_edge_ids)
             # get positive and negative probabilities, shape (batch_size, )
-            positive_probabilities = model[1](input_1=batch_src_node_embeddings, input_2=batch_dst_node_embeddings).squeeze(dim=-1).sigmoid()
-            negative_probabilities = model[1](input_1=batch_neg_src_node_embeddings, input_2=batch_neg_dst_node_embeddings).squeeze(dim=-1).sigmoid()
+            positive_probabilities = compute_link_logits(model[1], batch_src_node_embeddings, batch_dst_node_embeddings, batch_edge_messages).sigmoid()
+            negative_probabilities = compute_link_logits(model[1], batch_neg_src_node_embeddings, batch_neg_dst_node_embeddings, batch_edge_messages).sigmoid()
 
             if positive_probabilities_list is not None:
                 positive_probabilities_list.append(positive_probabilities.double().cpu().numpy())

@@ -13,7 +13,7 @@ from models.CAWN import CAWN
 from models.TCL import TCL
 from models.GraphMixer import GraphMixer
 from models.DyGFormer import DyGFormer
-from models.modules import MergeLayer
+from models.modules import build_link_predictor
 from utils.utils import set_random_seed, convert_to_gpu, get_parameter_sizes
 from utils.utils import get_neighbor_sampler, NegativeEdgeSampler
 from evaluate_models_utils import evaluate_model_link_prediction, evaluate_edge_bank_link_prediction
@@ -76,8 +76,9 @@ if __name__ == "__main__":
             set_random_seed(seed=run)
 
             args.seed = run
-            args.load_model_name = f'{args.model_name}_seed{args.seed}'
-            args.save_result_name = f'{args.negative_sample_strategy}_negative_sampling_{args.model_name}_seed{args.seed}'
+            head_suffix = '_contextual' if args.head == 'contextual' else ''
+            args.load_model_name = f'{args.model_name}{head_suffix}_seed{args.seed}'
+            args.save_result_name = f'{args.negative_sample_strategy}_negative_sampling_{args.model_name}{head_suffix}_seed{args.seed}'
 
             # set up logger
             logging.basicConfig(level=logging.INFO)
@@ -133,8 +134,7 @@ if __name__ == "__main__":
                                              max_input_sequence_length=args.max_input_sequence_length, device=args.device)
             else:
                 raise ValueError(f"Wrong value for model_name {args.model_name}!")
-            link_predictor = MergeLayer(input_dim1=node_raw_features.shape[1], input_dim2=node_raw_features.shape[1],
-                                        hidden_dim=node_raw_features.shape[1], output_dim=1)
+            link_predictor = build_link_predictor(head=args.head, node_feat_dim=node_raw_features.shape[1], edge_feat_dim=edge_raw_features.shape[1])
             model = nn.Sequential(dynamic_backbone, link_predictor)
             logger.info(f'model -> {model}')
             logger.info(f'model name: {args.model_name}, #parameters: {get_parameter_sizes(model) * 4} B, '

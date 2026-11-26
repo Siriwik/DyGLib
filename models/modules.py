@@ -68,6 +68,90 @@ class MergeLayer(nn.Module):
         return h
 
 
+class ContextualLinkPredictor(nn.Module):
+
+    def __init__(self, input_dim_node1: int, input_dim_node2: int, input_dim_context: int, hidden_dim: int, output_dim: int):
+        """
+        Predicts a link based on two node embeddings and context (the message of the queried edge):
+        input_dim_node1 + input_dim_node2 + (input_dim_context -> input_dim_node1) -> hidden_dim -> output_dim.
+        Ported unchanged from ContextualLinkPredictor in models/modules.py of Poštuvan et al.'s CTDG-link-anomaly-detection.
+        :param input_dim_node1: int, dimension of the first node embedding
+        :param input_dim_node2: int, dimension of the second node embedding
+        :param input_dim_context: int, dimension of context
+        :param hidden_dim: int, hidden dimension
+        :param output_dim: int, dimension of the output
+        """
+        super().__init__()
+        self.fc_down = nn.Linear(input_dim_context, input_dim_node1)
+        self.fc1 = nn.Linear(input_dim_node1 + input_dim_node2 + input_dim_node1, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.ReLU()
+
+    def forward(self, node_embedding1: torch.Tensor, node_embedding2: torch.Tensor, context: torch.Tensor):
+        """
+        Predicts a link based on two node embeddings and context.
+        :param node_embedding1: Tensor, shape (*, input_dim_node1)
+        :param node_embedding2: Tensor, shape (*, input_dim_node2)
+        :param context: Tensor, shape (*, input_dim_context)
+        :return:
+        """
+        # Tensor, shape (*, input_dim_node1)
+        projected_context = self.fc_down(context)
+        # Tensor, shape (*, input_dim_node1 + input_dim_node2 + input_dim_node1)
+        x = torch.cat([node_embedding1, node_embedding2, projected_context], dim=1)
+        # Tensor, shape (*, output_dim)
+        h = self.fc2(self.act(self.fc1(x)))
+        return h
+
+
+LINK_PREDICTION_HEADS = ['standard', 'contextual']
+
+
+def build_link_predictor(head: str, node_feat_dim: int, edge_feat_dim: int):
+    """
+    build the link prediction head
+    :param head: str, 'standard' (DyGLib's MergeLayer, sees the two node embeddings) or
+    'contextual' (ContextualLinkPredictor, also sees the message of the queried edge)
+    :param node_feat_dim: int, dimension of the node embeddings
+    :param edge_feat_dim: int, dimension of the edge messages
+    :return:
+    """
+    if head == 'standard':
+        return MergeLayer(input_dim1=node_feat_dim, input_dim2=node_feat_dim, hidden_dim=node_feat_dim, output_dim=1)
+    elif head == 'contextual':
+        return ContextualLinkPredictor(input_dim_node1=node_feat_dim, input_dim_node2=node_feat_dim, input_dim_context=edge_feat_dim,
+                                       hidden_dim=node_feat_dim, output_dim=1)
+    raise ValueError(f'Wrong value for head {head}!')
+
+
+def compute_link_logits(link_predictor: nn.Module, src_node_embeddings: torch.Tensor, dst_node_embeddings: torch.Tensor, edge_messages: torch.Tensor):
+    """
+    logits of the queried edges, with the same call for both heads (the standard head ignores the messages)
+    :param link_predictor: nn.Module, MergeLayer or ContextualLinkPredictor
+    :param src_node_embeddings: Tensor, shape (batch_size, node_feat_dim)
+    :param dst_node_embeddings: Tensor, shape (batch_size, node_feat_dim)
+    :param edge_messages: Tensor, shape (batch_size, edge_feat_dim), the message of each queried edge: its own message for a real edge,
+    the message of the real edge it was built from for a destination-swapped negative, the swapped message for a contextual negative
+    :return:
+        Tensor, shape (batch_size, )
+    """
+    if isinstance(link_predictor, ContextualLinkPredictor):
+        logits = link_predictor(node_embedding1=src_node_embeddings, node_embedding2=dst_node_embeddings, context=edge_messages)
+    else:
+        logits = link_predictor(input_1=src_node_embeddings, input_2=dst_node_embeddings)
+    return logits.squeeze(dim=-1)
+
+
+def get_edge_messages(edge_raw_features: torch.Tensor, edge_ids: np.ndarray):
+    """
+    :param edge_raw_features: Tensor, shape (num_edges + 1, edge_feat_dim), the backbone's edge features
+    :param edge_ids: ndarray, shape (batch_size, )
+    :return:
+        Tensor, shape (batch_size, edge_feat_dim)
+    """
+    return edge_raw_features[torch.from_numpy(edge_ids)]
+
+
 class MLPClassifier(nn.Module):
     def __init__(self, input_dim: int, dropout: float = 0.1):
         """

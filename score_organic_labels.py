@@ -20,7 +20,7 @@ from models.CAWN import CAWN
 from models.TCL import TCL
 from models.GraphMixer import GraphMixer
 from models.DyGFormer import DyGFormer
-from models.modules import MergeLayer
+from models.modules import build_link_predictor, compute_link_logits, get_edge_messages
 from utils.utils import set_random_seed, convert_to_gpu, get_neighbor_sampler
 from utils.metrics import get_anomaly_detection_metrics
 from utils.DataLoader import get_idx_data_loader, get_link_prediction_data, Data
@@ -80,7 +80,8 @@ def compute_edge_logits(model_name: str, model: nn.Module, data: Data, batch_siz
             else:
                 raise ValueError(f"Wrong value for model_name {model_name}!")
 
-            logits.append(model[1](input_1=batch_src_node_embeddings, input_2=batch_dst_node_embeddings).squeeze(dim=-1).double().cpu().numpy())
+            batch_edge_messages = get_edge_messages(model[0].edge_raw_features, batch_edge_ids)
+            logits.append(compute_link_logits(model[1], batch_src_node_embeddings, batch_dst_node_embeddings, batch_edge_messages).double().cpu().numpy())
 
     return np.concatenate(logits)
 
@@ -103,17 +104,22 @@ if __name__ == "__main__":
 
     train_ratio = 1 - args.val_ratio - args.test_ratio
     split_name = f'{round(100 * train_ratio)}-{round(100 * args.val_ratio)}-{round(100 * args.test_ratio)}'
-    score_folder = f"./scores/{args.dataset_name}/{split_name}/{args.model_name}/{TRAINING_SIGNAL}"
+    # the contextual head gets its own signal folder, so the pilot's standard-head scores are never overwritten
+    signal_name = f'{TRAINING_SIGNAL}_contextual' if args.head == 'contextual' else TRAINING_SIGNAL
+    # the label-selected checkpoint gets its own folder, so its scores never mix with the main (label-free) ones
+    checkpoint_suffix = '_labelsel' if args.checkpoint == 'labelsel' else ''
+    signal_name += checkpoint_suffix
+    score_folder = f"./scores/{args.dataset_name}/{split_name}/{args.model_name}/{signal_name}"
     os.makedirs(score_folder, exist_ok=True)
 
     metric_all_runs = {'validate': [], 'test': []}
 
-    for run in range(args.num_runs):
+    for run in range(args.start_run, args.start_run + args.num_runs):
 
         set_random_seed(seed=run)
 
         args.seed = run
-        args.save_model_name = f'{args.model_name}_seed{args.seed}'
+        args.save_model_name = f'{args.model_name}_contextual_seed{args.seed}' if args.head == 'contextual' else f'{args.model_name}_seed{args.seed}'
 
         # create model
         if args.model_name == 'TGAT':
@@ -145,13 +151,12 @@ if __name__ == "__main__":
                                          max_input_sequence_length=args.max_input_sequence_length, device=args.device)
         else:
             raise ValueError(f"Wrong value for model_name {args.model_name}!")
-        link_predictor = MergeLayer(input_dim1=node_raw_features.shape[1], input_dim2=node_raw_features.shape[1],
-                                    hidden_dim=node_raw_features.shape[1], output_dim=1)
+        link_predictor = build_link_predictor(head=args.head, node_feat_dim=node_raw_features.shape[1], edge_feat_dim=edge_raw_features.shape[1])
         model = nn.Sequential(dynamic_backbone, link_predictor)
 
         # load the best model saved by train_link_prediction.py
         save_model_folder = f"./saved_models/{args.model_name}/{args.dataset_name}/{args.save_model_name}"
-        model.load_state_dict(torch.load(os.path.join(save_model_folder, f"{args.save_model_name}.pkl"), map_location='cpu'))
+        model.load_state_dict(torch.load(os.path.join(save_model_folder, f"{args.save_model_name}{checkpoint_suffix}.pkl"), map_location='cpu'))
         model = convert_to_gpu(model, device=args.device)
         model.eval()
 
@@ -159,7 +164,7 @@ if __name__ == "__main__":
 
         if args.model_name in ['JODIE', 'DyRep', 'TGN']:
             # the memory in the saved best model has seen the training and validation edges, so the test edges are scored first
-            model[0].memory_bank.node_raw_messages = torch.load(os.path.join(save_model_folder, f"{args.save_model_name}_nonparametric_data.pkl"),
+            model[0].memory_bank.node_raw_messages = torch.load(os.path.join(save_model_folder, f"{args.save_model_name}{checkpoint_suffix}_nonparametric_data.pkl"),
                                                                 map_location=args.device)
             test_logits = compute_edge_logits(data=test_data, **compute_logits_kwargs)
             # the memory after training is not saved, rebuild it by replaying the training edges with the saved best model

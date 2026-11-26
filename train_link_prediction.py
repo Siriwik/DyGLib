@@ -16,7 +16,7 @@ from models.CAWN import CAWN
 from models.TCL import TCL
 from models.GraphMixer import GraphMixer
 from models.DyGFormer import DyGFormer
-from models.modules import MergeLayer
+from models.modules import build_link_predictor, compute_link_logits, get_edge_messages
 from utils.utils import set_random_seed, convert_to_gpu, get_parameter_sizes, create_optimizer
 from utils.utils import get_neighbor_sampler, NegativeEdgeSampler
 from evaluate_models_utils import evaluate_model_link_prediction
@@ -85,12 +85,13 @@ if __name__ == "__main__":
 
     val_metric_all_runs, new_node_val_metric_all_runs, test_metric_all_runs, new_node_test_metric_all_runs = [], [], [], []
 
-    for run in range(args.num_runs):
+    for run in range(args.start_run, args.start_run + args.num_runs):
 
         set_random_seed(seed=run)
 
         args.seed = run
-        args.save_model_name = f'{args.model_name}_seed{args.seed}'
+        # the standard head keeps the pilot's names, the contextual head gets its own logs, checkpoints and results
+        args.save_model_name = f'{args.model_name}_contextual_seed{args.seed}' if args.head == 'contextual' else f'{args.model_name}_seed{args.seed}'
 
         # set up logger
         logging.basicConfig(level=logging.INFO)
@@ -146,8 +147,7 @@ if __name__ == "__main__":
                                          max_input_sequence_length=args.max_input_sequence_length, device=args.device)
         else:
             raise ValueError(f"Wrong value for model_name {args.model_name}!")
-        link_predictor = MergeLayer(input_dim1=node_raw_features.shape[1], input_dim2=node_raw_features.shape[1],
-                                    hidden_dim=node_raw_features.shape[1], output_dim=1)
+        link_predictor = build_link_predictor(head=args.head, node_feat_dim=node_raw_features.shape[1], edge_feat_dim=edge_raw_features.shape[1])
         model = nn.Sequential(dynamic_backbone, link_predictor)
         logger.info(f'model -> {model}')
         logger.info(f'model name: {args.model_name}, #parameters: {get_parameter_sizes(model) * 4} B, '
@@ -163,6 +163,10 @@ if __name__ == "__main__":
 
         early_stopping = EarlyStopping(patience=args.patience, save_model_folder=save_model_folder,
                                        save_model_name=args.save_model_name, logger=logger, model_name=args.model_name)
+        # saves the epoch with the best organic validation AP next to the label-free checkpoint, its patience is never reached
+        label_selected_saver = EarlyStopping(patience=args.num_epochs + 1, save_model_folder=save_model_folder,
+                                             save_model_name=f'{args.save_model_name}_labelsel', logger=logger, model_name=args.model_name)
+        label_free_epoch, label_selected_epoch = None, None
 
         loss_func = nn.BCELoss()
 
@@ -262,9 +266,12 @@ if __name__ == "__main__":
                                                                           node_interact_times=batch_node_interact_times)
                 else:
                     raise ValueError(f"Wrong value for model_name {args.model_name}!")
+                # message of each queried edge, shape (batch_size, edge_feat_dim).
+                # the negatives are structural (destination swapped), so they keep the message of the real edge they were built from
+                batch_edge_messages = get_edge_messages(model[0].edge_raw_features, batch_edge_ids)
                 # get positive and negative probabilities, shape (batch_size, )
-                positive_probabilities = model[1](input_1=batch_src_node_embeddings, input_2=batch_dst_node_embeddings).squeeze(dim=-1).sigmoid()
-                negative_probabilities = model[1](input_1=batch_neg_src_node_embeddings, input_2=batch_neg_dst_node_embeddings).squeeze(dim=-1).sigmoid()
+                positive_probabilities = compute_link_logits(model[1], batch_src_node_embeddings, batch_dst_node_embeddings, batch_edge_messages).sigmoid()
+                negative_probabilities = compute_link_logits(model[1], batch_neg_src_node_embeddings, batch_neg_dst_node_embeddings, batch_edge_messages).sigmoid()
 
                 predicts = torch.cat([positive_probabilities, negative_probabilities], dim=0)
                 labels = torch.cat([torch.ones_like(positive_probabilities), torch.zeros_like(negative_probabilities)], dim=0)
@@ -329,8 +336,9 @@ if __name__ == "__main__":
             logger.info(f'validate loss: {np.mean(val_losses):.4f}')
             for metric_name in val_metrics[0].keys():
                 logger.info(f'validate {metric_name}, {np.mean([val_metric[metric_name] for val_metric in val_metrics]):.4f}')
-            # the organic labels are only logged, they are not used for training or for early stopping
-            log_organic_label_metrics(logger=logger, split_name='validate', positive_probabilities_list=val_positive_probabilities_list, labels=val_data.labels)
+            # the organic labels are not used for training or for early stopping, only for the second, label-selected checkpoint
+            organic_val_epoch_metrics = log_organic_label_metrics(logger=logger, split_name='validate', positive_probabilities_list=val_positive_probabilities_list,
+                                                                  labels=val_data.labels)
             logger.info(f'new node validate loss: {np.mean(new_node_val_losses):.4f}')
             for metric_name in new_node_val_metrics[0].keys():
                 logger.info(f'new node validate {metric_name}, {np.mean([new_node_val_metric[metric_name] for new_node_val_metric in new_node_val_metrics]):.4f}')
@@ -376,11 +384,20 @@ if __name__ == "__main__":
                 for metric_name in new_node_test_metrics[0].keys():
                     logger.info(f'new node test {metric_name}, {np.mean([new_node_test_metric[metric_name] for new_node_test_metric in new_node_test_metrics]):.4f}')
 
+            # second checkpoint, for comparison with work that selects by labels: the epoch with the best organic validation AP.
+            # it only saves, it never stops training, so it chooses among the epochs run before the label-free early stopping ends the run
+            label_selected_saver.step([('organic average_precision', organic_val_epoch_metrics['average_precision'], True)], model)
+            if label_selected_saver.counter == 0:
+                label_selected_epoch = epoch + 1
+                logger.info(f'label-selected checkpoint at epoch {label_selected_epoch}, organic validate average_precision {organic_val_epoch_metrics["average_precision"]:.4f}')
+
             # select the best model based on all the validate metrics
             val_metric_indicator = []
             for metric_name in val_metrics[0].keys():
                 val_metric_indicator.append((metric_name, np.mean([val_metric[metric_name] for val_metric in val_metrics]), True))
             early_stop = early_stopping.step(val_metric_indicator, model)
+            if early_stopping.counter == 0:
+                label_free_epoch = epoch + 1
 
             if early_stop:
                 break
@@ -476,6 +493,28 @@ if __name__ == "__main__":
             logger.info(f'new node test {metric_name}, {average_new_node_test_metric:.4f}')
             new_node_test_metric_dict[metric_name] = average_new_node_test_metric
 
+        # test the label-selected checkpoint, after (and without changing) the evaluation of the label-free one
+        logger.info(f'label-free checkpoint from epoch {label_free_epoch}, label-selected checkpoint from epoch {label_selected_epoch}')
+        label_selected_saver.load_checkpoint(model)
+        label_selected_test_positive_probabilities_list = []
+        label_selected_test_losses, label_selected_test_metrics = evaluate_model_link_prediction(model_name=args.model_name,
+                                                                                                 model=model,
+                                                                                                 neighbor_sampler=full_neighbor_sampler,
+                                                                                                 evaluate_idx_data_loader=test_idx_data_loader,
+                                                                                                 evaluate_neg_edge_sampler=test_neg_edge_sampler,
+                                                                                                 evaluate_data=test_data,
+                                                                                                 loss_func=loss_func,
+                                                                                                 num_neighbors=args.num_neighbors,
+                                                                                                 time_gap=args.time_gap,
+                                                                                                 positive_probabilities_list=label_selected_test_positive_probabilities_list)
+        label_selected_test_metric_dict = {}
+        for metric_name in label_selected_test_metrics[0].keys():
+            label_selected_test_metric_dict[metric_name] = np.mean([test_metric[metric_name] for test_metric in label_selected_test_metrics])
+            logger.info(f'label-selected test {metric_name}, {label_selected_test_metric_dict[metric_name]:.4f}')
+        label_selected_organic_test_metric_dict = log_organic_label_metrics(logger=logger, split_name='label-selected test',
+                                                                            positive_probabilities_list=label_selected_test_positive_probabilities_list,
+                                                                            labels=test_data.labels, num_bootstraps=1000)
+
         single_run_time = time.time() - run_start_time
         logger.info(f'Run {run + 1} cost {single_run_time:.2f} seconds.')
 
@@ -486,7 +525,7 @@ if __name__ == "__main__":
         new_node_test_metric_all_runs.append(new_node_test_metric_dict)
 
         # avoid the overlap of logs
-        if run < args.num_runs - 1:
+        if run < args.start_run + args.num_runs - 1:
             logger.removeHandler(fh)
             logger.removeHandler(ch)
 
@@ -505,6 +544,12 @@ if __name__ == "__main__":
                 "new node test metrics": {metric_name: f'{new_node_test_metric_dict[metric_name]:.4f}' for metric_name in new_node_test_metric_dict}
             }
         result_json["organic test metrics"] = organic_test_metric_dict
+        result_json["label-free epoch"] = label_free_epoch
+        # the checkpoint with the best organic validation AP: uses validation labels, noisy and optimistic, report separately
+        result_json["label-selected epoch"] = label_selected_epoch
+        result_json["label-selected organic validate average_precision"] = label_selected_saver.best_metrics['organic average_precision']
+        result_json["label-selected test metrics"] = {metric_name: f'{label_selected_test_metric_dict[metric_name]:.4f}' for metric_name in label_selected_test_metric_dict}
+        result_json["label-selected organic test metrics"] = label_selected_organic_test_metric_dict
         result_json = json.dumps(result_json, indent=4)
 
         save_result_folder = f"./saved_results/{args.model_name}/{args.dataset_name}"
